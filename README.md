@@ -1,205 +1,136 @@
-# Expense Tracker — DevSecOps Hands-on Lab
+# Expense Tracker: DevSecOps CI/CD Pipeline to AWS EC2
 
-**Stack:** React/Vite + Nginx, Node.js/Express, MongoDB, Docker Compose, GitHub Actions, Trivy, Docker Hub, AWS EC2.
+A containerized 3-tier web app (React + Node.js/Express + MongoDB) shipped by a **DevSecOps pipeline**. Every push to `main` is linted, tested and security-scanned with **Trivy**. The pipeline builds and scans the Docker images, pushes them to **Docker Hub** with commit-SHA tags, and deploys them automatically to **AWS EC2** with a health-checked rollout. Any failed gate blocks everything after it.
 
-## Learning objectives
+![Pipeline](https://img.shields.io/badge/pipeline-passing-2ea44f?logo=githubactions&logoColor=white)
+![Security](https://img.shields.io/badge/security-Trivy-1904DA?logo=aqua&logoColor=white)
+![Docker](https://img.shields.io/badge/containers-Docker%20Compose-2496ED?logo=docker&logoColor=white)
+![AWS](https://img.shields.io/badge/deploy-AWS%20EC2-FF9900?logo=amazonaws&logoColor=white)
+![Stack](https://img.shields.io/badge/stack-React%20%7C%20Express%20%7C%20MongoDB-61DAFB?logo=react&logoColor=black)
 
-Students will build a pipeline that runs **lint + tests**, performs **Trivy Critical-only repository scanning**, builds frontend/backend images, performs **Trivy Critical-only image scanning**, pushes versioned images to Docker Hub, and deploys automatically to EC2. A failed required step blocks downstream jobs. Pull requests only run quality and repository scanning; only pushes to `main` publish and deploy.
+## Pipeline
 
-> **Important:** Trivy detects known issues using its available databases and rules; a clean scan is not proof of security. HIGH/MEDIUM/LOW findings are not blocking. Scanner errors **are** blocking. A secret detection's severity behavior is scanner-defined; do not commit secrets regardless of the threshold. This training example uses Docker Hub credentials and SSH; use protected GitHub environments, least privilege and short-lived credentials where feasible.
-
-## 1 — Requirements
-
-- GitHub repository containing this project (default branch **main**).
-- Docker Desktop locally, or Docker Engine + Docker Compose plugin.
-- Node.js 22 and npm for local lint/tests.
-- Docker Hub account; create repositories **expense-backend** and **expense-frontend** (public or private).
-- AWS Ubuntu EC2 instance with a public IP/DNS and SSH key pair.
-- Security group inbound **TCP 22** from trusted GitHub runner egress IPs or your managed runner; **TCP 80** from intended users. For a classroom demo with GitHub-hosted runners, IP allowlisting is challenging because runner IPs change; prefer a self-hosted runner or an approved secure access mechanism. Never leave SSH open to the world as a long-term solution.
-- EC2 outbound internet access for Docker Hub pulls.
-
-## 2 — Test locally before GitHub
-
-From the project root:
-
-```bash
-cd backend
-npm install
-npm run lint
-npm test
-cd ../frontend
-npm install
-npm run lint
-npm test
-npm run build
-cd ..
-docker compose up -d --build
-docker compose ps
-curl -f http://localhost/api/health
+```mermaid
+flowchart LR
+    push[git push main] --> q[Lint + unit tests<br/>backend & frontend]
+    push --> tr[Trivy repo scan<br/>vulns, misconfig, secrets]
+    q --> b[Build Docker images]
+    tr --> b
+    b --> ti[Trivy image scan<br/>CRITICAL blocks]
+    ti --> hub[(Docker Hub<br/>tag = commit SHA)]
+    hub --> d[Deploy to EC2<br/>SSH, verified host key]
+    d --> h{Health check<br/>/api/health}
+    h -->|pass| ok[Live]
+    h -->|fail after 150 s| x[Pipeline fails]
 ```
 
-Open **http://localhost**. MongoDB data is persisted in the `mongo-data` named volume. Stop without deleting the database using `docker compose down`. **Never use `docker compose down -v`** unless you intend to delete the database.
-
-Note: The original ZIP has no `package-lock.json`. For repeatable CI, after `npm install` succeeds, **commit the generated `backend/package-lock.json` and `frontend/package-lock.json`**. The included workflow uses `npm install` so it works with the original ZIP; you can upgrade to `npm ci` after committing lockfiles.
-
-## 3 — Create Docker Hub token
-
-1. Sign in to Docker Hub → Account settings → Personal access tokens.
-2. Generate a token with repository push permissions.
-3. Create Docker Hub repositories `expense-backend` and `expense-frontend` under your account.
-4. Store token in GitHub Actions secret `DOCKERHUB_TOKEN`. Do **not** put the token in YAML or commit it.
-
-Images are tagged with the Git commit SHA, e.g. `YOURUSER/expense-backend:<commit-sha>`, avoiding mutable `latest` deployments.
-
-## 4 — Prepare EC2 (Ubuntu)
-
-1. Launch Ubuntu EC2 (for example t3.small or larger, depending on workload), with an SSH key pair. Note the public DNS/IP.
-2. Configure inbound TCP 80 and narrowly controlled SSH TCP 22. Use HTTPS and a domain for production; this lab demonstrates HTTP only.
-3. Connect from your computer:
-
-```bash
-chmod 400 ~/Downloads/your-ec2-key.pem
-ssh -i ~/Downloads/your-ec2-key.pem ubuntu@YOUR_EC2_PUBLIC_IP
-```
-
-4. Install Docker and ComposeV2.
-```bash
-sudo apt update && sudo apt install -y docker.io docker-compose-v2
-sudo systemctl enable --now docker
-```
-
-Confirm:
-
-```bash
-docker --version
-docker compose version
-```
-
-5. Allow your EC2 SSH user to run Docker (note: membership in the docker group is effectively root-equivalent):
-
-```bash
-sudo usermod -aG docker "$USER"
-exit
-```
-
-Reconnect via SSH, then verify `docker ps` works without sudo. Create the deployment folder:
-
-```bash
-mkdir -p ~/expense-tracker
-```
-
-6. **Verify the server host key independently before trusting it.** On EC2, get the ED25519 fingerprint:
-
-```bash
-sudo ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub -E sha256
-```
-
-The output contains a fingerprint such as `SHA256:...`. Copy only the **SHA256:...** string to the GitHub variable `EC2_HOST_FINGERPRINT`. Confirm your instance really uses the ED25519 SSH host key. The workflow retrieves the public host key using `ssh-keyscan` but **refuses to connect unless its fingerprint matches the trusted value**. Do not copy an unverified fingerprint from a network scan.
-
-## 5 — Configure GitHub Actions variables and secrets
-
-Repository → **Settings → Secrets and variables → Actions**.
-
-| Name | GitHub type | Example / what to enter |
+| Stage | What it does | Blocks on |
 |---|---|---|
-| `EC2_HOST` | Variable | `ec2-xx-xx-xx-xx.compute.amazonaws.com` or public IP |
-| `EC2_USER` | Variable | `ubuntu` |
-| `EC2_SSH_KEY` | Secret | **Complete PEM/OpenSSH private key contents**, including BEGIN/END lines |
-| `EC2_HOST_FINGERPRINT` | Variable | Verified `SHA256:...` ED25519 host key fingerprint |
-| `DOCKERHUB_USERNAME` | Variable | Your Docker Hub username |
-| `DOCKERHUB_TOKEN` | Secret | Docker Hub personal access token |
+| `quality` | ESLint, Node test runner and a production build for backend and frontend | any lint error or failing test |
+| `trivy-repository` | Scans source and dependencies for vulnerabilities, misconfigurations and leaked secrets | any CRITICAL finding or scanner error |
+| `image-build-scan-push` | Builds both images, scans each one, and pushes to Docker Hub **only if the scans pass** | CRITICAL image CVE, build or push error |
+| `deploy` | Verifies the EC2 SSH fingerprint, uploads the Compose file, pulls the new images, restarts and health-checks (30 tries) | SSH failure, fingerprint mismatch, failed health check |
 
-To get the private key content locally, run `cat ~/Downloads/your-ec2-key.pem` and copy the entire output to the secret. **Never commit or share the key**. The public key is already authorized on EC2 by the EC2 key pair; you do **not** need a second authentication public key in GitHub. `EC2_HOST_FINGERPRINT` authenticates the **server**, whereas `EC2_SSH_KEY` authenticates the **client**.
+Pull requests run only the quality and repository-scan stages. Only `main` publishes and deploys.
 
-In **Settings → Environments**, create `production` if you want environment protection rules. The deployment job uses that environment. If you add required reviewers, deployment waits for approval (no longer fully unattended).
+## Application architecture
 
-## 6 — Push and observe pipeline 
-# Hello 
-
-```bash
-git init
-git add .
-git commit -m "Add Trivy CI/CD pipeline"
-git branch -M main
-git remote add origin https://github.com/YOUR_USERNAME/YOUR_REPO.git
-git push -u origin main
+```mermaid
+flowchart LR
+    user[Browser] -->|HTTP :80| fe
+    subgraph ec2[AWS EC2 · Docker Compose]
+        fe[frontend<br/>React build on Nginx] -->|/api/ reverse proxy| be[backend<br/>Node.js / Express :5000]
+        be --> db[(MongoDB 7<br/>named volume)]
+    end
 ```
 
-If you already have a repository, do not reinitialize or re-add `origin`; simply commit and push.
+- **Only port 80 is public.** Nginx serves the React app and proxies `/api/` to the backend over the private Docker network. MongoDB is never exposed.
+- **Multi-stage frontend image:** Node builds the app, and only the static files ship on `nginx:alpine`.
+- **Data survives redeploys** through the `mongo-data` named volume.
+- **REST API:** create, list, filter and summarize expenses by category and date range, plus `/api/health` for the deploy check.
 
-Open **GitHub → Actions → Expense Tracker - CI Security CD**.
+## What I built
 
-1. `quality`: backend/frontend lint, unit tests, frontend production build.
-2. `trivy-repository`: scans the repository for Critical findings.
-3. `image-build-scan-push`: builds both images, scans each for **CRITICAL** vulnerabilities, then logs into Docker Hub and pushes images **only if scans pass**.
-4. `deploy`: checks the trusted EC2 fingerprint, copies `docker-compose.prod.yml`, authenticates Docker Hub, pulls the new commit-tagged images, starts containers, and checks `http://127.0.0.1/api/health` up to 30 times.
+- **Shift-left security:** Trivy scans the repository (dependencies, Dockerfile and config misconfigurations, secrets) *and* every image before it can reach a registry.
+- **Immutable releases:** images are tagged with the Git commit SHA, never `latest`, so every deployment traces back to an exact commit and a rollback means redeploying an old tag.
+- **Secure deployment over SSH:** the runner compares the EC2 host key with a pre-verified SHA256 fingerprint before connecting (no blind `StrictHostKeyChecking=no`). The Docker Hub token reaches the server over SSH stdin, never in a command line or file.
+- **Secrets management:** the SSH key and Docker Hub token are GitHub Actions secrets, with the `production` environment and a concurrency lock to prevent overlapping deploys.
+- **Testable backend design:** Express routes (`app.js`) are separated from the database and listener (`server.js`), so the API tests run without MongoDB and exit cleanly.
 
-The pipeline blocks on any lint/test failure, any Critical Trivy finding, Docker build/push error, SSH failure, or failed deployment health check. Lower-severity vulnerability findings do not fail the scan. A post-deployment health-check failure means the new version may already be running; this lab **does not automatically roll back**.
+## Results
 
-## 7 — Verify EC2 deployment
+- **All 4 stages green:** lint and tests, repo scan, image build/scan/push, and EC2 deploy with a passing health check. A full run takes **~2 min 40 s** from push to live.
+- **Debugged a broken pipeline:** the first runs failed with `Unable to resolve action aquasecurity/trivy-action@0.33.1`. That action version didn't exist, so I pinned a valid release (`v0.36.0`) and the pipeline went green.
 
-```bash
-ssh -i ~/Downloads/your-ec2-key.pem ubuntu@YOUR_EC2_PUBLIC_IP
-cd ~/expense-tracker
-docker compose -f docker-compose.prod.yml ps
-curl -f http://localhost/api/health
+## Repository structure
+
+```text
+.
+├── .github/workflows/devsecops.yml   # 4-stage CI/CD pipeline
+├── backend/                          # Express API, Mongoose model, node:test tests, Dockerfile
+├── frontend/                         # React (Vite) app, Nginx config, multi-stage Dockerfile
+├── docker-compose.yml                # local: builds images from source
+├── docker-compose.prod.yml           # EC2: pulls SHA-tagged images from Docker Hub
+├── .env.example                      # sample configuration (no secrets)
+└── docs/lab-guide.md                 # full setup guide, exercises, troubleshooting
 ```
 
-In your browser, open `http://YOUR_EC2_PUBLIC_IP`.
+## Run it locally
 
-The frontend Nginx proxy routes `/api/` requests to the backend container using the Docker network. MongoDB is not exposed to the internet. The production Compose file uses images from Docker Hub and preserves the `mongo-data` volume across normal deployments.
-
-## 8 — Classroom exercises
-
-**Exercise A — Lint failure:** Add an undefined variable in `backend/src/server.js`, e.g. `console.log(notDefined);`, commit and push. Verify the `quality` job fails and nothing is deployed. Remove it and push again.
-
-**Exercise B — Test failure:** Change `assert.equal(response.status, 200)` to `assert.equal(response.status, 201)` in `backend/tests/api.test.js`. Commit and push. Verify tests fail and deployment is blocked. Restore it.
-
-**Exercise C — Trivy Critical finding:** In a **temporary training branch**, use a deliberately vulnerable dependency or test image with a **currently confirmed Critical CVE**. Run Trivy locally to verify the finding before pushing. Vulnerability database results change over time, so this guide does not hardcode an unreliable package version. Never deploy the vulnerable image. Verify the image scan exits nonzero and Docker Hub push is skipped; fix the vulnerability and repeat.
-
-**Exercise D — Successful CD:** Change a visible frontend heading, commit to `main`, and verify the new image SHA appears on Docker Hub and EC2 serves the update.
-
-## 9 — Troubleshooting
-
-- **Trivy fails with database download/network errors:** This is a scanner failure, not a vulnerability result. Retry; do not bypass the gate.
-- **SSH timeout:** Check EC2 is running, security group inbound 22, route/NACL and runner reachability.
-- **Fingerprint mismatch:** Stop and independently verify the EC2 host ED25519 fingerprint. Do not disable StrictHostKeyChecking.
-- **Permission denied (publickey):** Verify the EC2 username, authorized key, and full private key contents.
-- **Docker permission denied:** Reconnect after `usermod -aG docker`; check `docker ps`.
-- **Docker Hub pull denied:** Verify username/token, repositories, and Docker Hub permissions.
-- **Health check fails:** Run `docker compose -f docker-compose.prod.yml logs --tail=100`; verify backend can reach MongoDB and frontend can reach backend.
-- **Port 80 busy:** Stop the other web server or change the published port in `docker-compose.prod.yml` and health check accordingly.
-- **GitHub workflow not triggered:** Check branch name is `main`, workflow is under `.github/workflows/`, and Actions are enabled.
-
-## 10 — Security and production improvements
-
-This is a learning deployment. For production: use TLS/HTTPS, restrict SSH via a trusted network or use a managed deployment method, protect the `production` environment, pin GitHub Actions to immutable commit hashes, pin container base images by digest, commit npm lockfiles and use `npm ci`, configure MongoDB authentication and backups, use least-privilege Docker Hub tokens, add integration tests and rollback, and consider an image registry with immutable tags. No OWASP Dependency-Check or SonarQube is included, as requested.
-
-
-## ESLint `fetch is not defined` troubleshooting
-
-Node.js 22 includes the global `fetch` API, but ESLint `no-undef` requires it to be declared as a global. Both backend and frontend ESLint configurations include `fetch: 'readonly'`. Do not disable the `no-undef` rule to solve this error.
-
-Run from the project root:
+**Prerequisites:** Docker with the Compose plugin; Node.js 22 to run lint and tests.
 
 ```bash
-cd backend && npm install && npm run lint && npm test
+docker compose up -d --build
+curl -f http://localhost/api/health      # {"status":"ok", ...}
+# open http://localhost
+docker compose down                      # keeps the database volume
+```
+
+Lint and tests:
+
+```bash
+cd backend  && npm install && npm run lint && npm test
 cd ../frontend && npm install && npm run lint && npm test && npm run build
 ```
 
-If your local Node version is older, upgrade to Node.js 22 to match GitHub Actions.
+## Deploy your own
 
+1. Launch an Ubuntu EC2 instance with Docker and Compose v2. Open port 80, and port 22 only to a trusted source.
+2. Create the Docker Hub repositories `expense-backend` and `expense-frontend`, plus an access token.
+3. Add to **Settings → Secrets and variables → Actions**:
 
-## Backend test process exits automatically (fix)
+   | Name | Type |
+   |---|---|
+   | `EC2_HOST`, `EC2_USER`, `EC2_HOST_FINGERPRINT`, `DOCKERHUB_USERNAME` | Variables |
+   | `EC2_SSH_KEY`, `DOCKERHUB_TOKEN` | Secrets |
 
-The backend is now separated into `backend/src/app.js` (Express routes and middleware) and `backend/src/server.js` (MongoDB connection and port 5000 listener). Tests import `app.js` so they do **not** connect to MongoDB or start the production server. Each test opens a temporary listener on an ephemeral port and closes it in `finally`.
+4. Push to `main`.
 
-From `backend/`, run:
+Full steps, including how to verify the host fingerprint safely, are in [`docs/lab-guide.md`](docs/lab-guide.md).
 
-```bash
-npm install
-npm run lint
-npm test
-```
+## Screenshots
 
-Expected: 4 passing tests, 0 failures, and the shell prompt returns automatically. If you see `Connected to MongoDB` during `npm test`, check that `tests/api.test.js` imports `../src/app.js`, not `../src/server.js`. The production Docker command remains `node src/server.js`.
+<!-- Add images to docs/screenshots/ and uncomment:
+![Pipeline run](docs/screenshots/01-pipeline-green.png)
+![Docker Hub tags](docs/screenshots/02-dockerhub-sha-tags.png)
+![App on EC2](docs/screenshots/03-app-on-ec2.png)
+-->
+
+## Challenges and what I learned
+
+- **Pin versions that exist.** A non-existent action tag fails the job before any step runs. Reading the exact error line found the cause in seconds.
+- **A clean Trivy scan isn't proof of security.** It only finds *known* issues in its database, so the gate blocks CRITICAL findings while lower severities stay visible without blocking.
+- **Separate the app from its side effects.** Splitting `app.js` from `server.js` made the API testable in CI without a database.
+- **Host-key verification matters in CD.** Disabling it would let a spoofed server receive the deploy credentials.
+
+## Possible improvements
+
+- HTTPS with a domain (Let's Encrypt or an ALB with ACM)
+- Switch to `npm ci` with the committed lockfiles and pin actions and base images by digest
+- Automatic rollback to the previous SHA when the health check fails
+- MongoDB authentication and scheduled backups
+- Replace SSH deploys with AWS SSM or ECS, and define the EC2 host in Terraform
+
+---
+
+Built during the bongoDev DevOps bootcamp, 2026.
